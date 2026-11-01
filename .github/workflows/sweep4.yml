@@ -1,0 +1,85 @@
+name: sweep4
+
+on:
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: 'ports'
+        required: true
+        default: '8000,8080,3000,3001,3002,3004,3005,4000,30000,8081,8082,8085,8086,8088,8089,8090,8100,8443,5000,5001,5002,8001,8002,8005,9000,9001,8888,5678,1234,7860,7861,18081,23333,11435,9999,12345,1080,2080,3128,7890,7891,8118,10808,10809,2375,2379,2377,4243,10250,10255,6443,4646,5050,8500'
+      rate:
+        description: 'packets per second'
+        required: true
+        default: '15000'
+      host_budget:
+        description: 'Soft per-host validation wall clock seconds (raise for a dense-router drain)'
+        required: false
+        default: '90'
+      shard_offset:
+        description: 'starting shard index offset (e.g. 0, 20, 40)'
+        required: false
+        default: '0'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install scan and validation tools
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* || true
+          for i in 1 2 3; do sudo apt-get update -qq && break || sleep 5; done
+          for i in 1 2 3; do sudo apt-get install -y -qq masscan && break || sleep 5; done
+          python3 -m pip install -q aiohttp
+          masscan --version | head -2 || true
+      - name: Run shard ${{ matrix.slot }} (Scan -> Filter Middleboxes -> Validate)
+        env:
+          HOST_BUDGET: ${{ github.event.inputs.host_budget || 90 }}
+        run: |
+          SHARD_ID=$(( ${{ github.event.inputs.shard_offset || 0 }} + ${{ matrix.slot }} ))
+          F="data/sweep4/shard_${SHARD_ID}.txt"
+          if [ ! -f "$F" ]; then
+            echo "No shard file $F — skipping slot ${{ matrix.slot }}"
+            echo "[]" > "hits_${SHARD_ID}.json"
+            echo "[]" > "validated_${SHARD_ID}.json"
+            touch "candidates_clean_${SHARD_ID}.jsonl" "validated_${SHARD_ID}.jsonl"
+            exit 0
+          fi
+          echo "shard ${SHARD_ID} (slot ${{ matrix.slot }}): $(wc -l < $F) cidrs"
+          sudo masscan -iL "$F" -p${{ github.event.inputs.ports }} \
+            --rate ${{ github.event.inputs.rate }} \
+            --wait 3 -oJ "hits_${SHARD_ID}.json" || true
+          if [ ! -s "hits_${SHARD_ID}.json" ]; then
+            echo "[]" > "hits_${SHARD_ID}.json"
+          fi
+          echo "raw hits: $(grep -c '\"ip\"' hits_${SHARD_ID}.json 2>/dev/null || echo 0)"
+          HITS_DIR=. OUT_DIR=. python3 merge_filter.py
+          mv candidates_clean.jsonl "candidates_clean_${SHARD_ID}.jsonl" || true
+          mv middleboxes.jsonl "middleboxes_${SHARD_ID}.jsonl" || true
+          if [ -s hosts_pass1.txt ]; then
+            python3 validate_v2.py \
+              --hosts hosts_pass1.txt \
+              --models 0 \
+              --workers 128 \
+              --timeout 10 \
+              -o "validated_${SHARD_ID}.json"
+          else
+            echo "[]" > "validated_${SHARD_ID}.json"
+            touch "validated_${SHARD_ID}.jsonl"
+          fi
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep4-hits-${{ github.event.inputs.shard_offset || 0 }}-${{ matrix.slot }}
+          path: |
+            hits_*.json
+            candidates_clean_*.jsonl
+            validated_*.json
+            validated_*.jsonl
